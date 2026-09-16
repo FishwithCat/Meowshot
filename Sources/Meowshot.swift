@@ -1,5 +1,38 @@
 import AppKit
 import Carbon
+import Vision
+import ImageIO
+
+enum CaptureAction {
+    case image, text
+
+    static func confirmation(keyCode: UInt16, modifiers: NSEvent.ModifierFlags) -> CaptureAction? {
+        guard keyCode == 36 || keyCode == 76 else { return nil }
+        return modifiers.contains(.command) ? .text : .image
+    }
+}
+
+struct TextCaptureState {
+    var id: UUID?
+
+    mutating func complete(id: UUID, text: String?, pasteboard: NSPasteboard) -> Bool {
+        guard self.id == id else { return false }
+        self.id = nil
+        guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        let item = NSPasteboardItem()
+        guard item.setString(text, forType: .string) else { return false }
+        pasteboard.clearContents()
+        return pasteboard.writeObjects([item])
+    }
+}
+
+func recognizedText(in image: CGImage, request: VNRecognizeTextRequest) throws -> String {
+    request.recognitionLevel = .accurate
+    request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+    request.automaticallyDetectsLanguage = true
+    try VNImageRequestHandler(cgImage: image).perform([request])
+    return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+}
 
 struct RegionSelection {
     var rect = CGRect.zero
@@ -42,17 +75,27 @@ struct RegionSelection {
     }
 }
 
-func captureArguments(rect: CGRect) -> [String] {
-    ["-c", "-x", "-t", "png", "-R\(Int(rect.minX)),\(Int(rect.minY)),\(Int(rect.width)),\(Int(rect.height))"]
+func captureArguments(rect: CGRect, file: URL? = nil) -> [String] {
+    (file == nil ? ["-c"] : []) + ["-x", "-t", "png", "-R\(Int(rect.minX)),\(Int(rect.minY)),\(Int(rect.width)),\(Int(rect.height))"]
+        + (file.map { [$0.path] } ?? [])
 }
 
 final class SelectionWindow: NSWindow {
     override var canBecomeKey: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command),
+           CaptureAction.confirmation(keyCode: event.keyCode, modifiers: event.modifierFlags) != nil {
+            contentView?.keyDown(with: event)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 final class SelectionView: NSView {
     var selection = RegionSelection()
-    var finish: ((CGRect?) -> Void)?
+    var finish: ((CaptureAction?) -> Void)?
     override var acceptsFirstResponder: Bool { true }
 
     override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
@@ -87,12 +130,9 @@ final class SelectionView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        switch event.keyCode {
-        case 53: finish?(nil)
-        case 36, 76:
-            if selection.rect.width >= 1 && selection.rect.height >= 1 { finish?(selection.rect) }
-        default: break
-        }
+        if event.keyCode == 53 { finish?(nil) }
+        else if let action = CaptureAction.confirmation(keyCode: event.keyCode, modifiers: event.modifierFlags),
+                selection.rect.width >= 1, selection.rect.height >= 1 { finish?(action) }
     }
 }
 
@@ -115,6 +155,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var captureItem: NSMenuItem!
     private var selectionWindow: NSWindow?
     private var permission = CapturePermission()
+    private var textState = TextCaptureState()
+    private var recognitionRequest: VNRecognizeTextRequest?
+    private var cancelHotKey: EventHotKeyRef?
+    private var temporaryDirectory: URL?
+    private var previousApplication: NSRunningApplication?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -136,10 +181,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
 
         var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
-            guard let context else { return OSStatus(eventNotHandledErr) }
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
+            guard let context, let event else { return OSStatus(eventNotHandledErr) }
+            var hotKeyID = EventHotKeyID()
+            guard GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                    nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID) == noErr else { return OSStatus(eventNotHandledErr) }
             let delegate = Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue()
-            DispatchQueue.main.async { delegate.captureRegion() }
+            let id = hotKeyID.id
+            DispatchQueue.main.async {
+                if id == 2 { delegate.cancelTextCapture() }
+                else { delegate.captureRegion() }
+            }
             return noErr
         }, 1, &event, Unmanaged.passUnretained(self).toOpaque(), nil)
         let result = RegisterEventHotKey(UInt32(kVK_ANSI_X), UInt32(cmdKey | shiftKey),
@@ -152,7 +204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func captureRegion() {
-        guard capture == nil, selectionWindow == nil else { return }
+        guard capture == nil, selectionWindow == nil, textState.id == nil else { return }
         switch permission.action(granted: CGPreflightScreenCaptureAccess()) {
         case .capture:
             break
@@ -170,6 +222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         guard let mainScreen = NSScreen.screens.first else { return }
+        previousApplication = NSWorkspace.shared.frontmostApplication
         let desktop = NSScreen.screens.reduce(CGRect.null) { $0.union($1.frame) }
         let window = SelectionWindow(contentRect: desktop, styleMask: .borderless, backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -180,14 +233,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         let view = SelectionView(frame: CGRect(origin: .zero, size: desktop.size))
         view.setAccessibilityLabel("截图选区")
-        view.setAccessibilityHelp("拖动选区内部移动，拖动边缘调整大小，按 Return 确认，Escape 取消。")
-        view.finish = { [weak self, weak view] rect in
+        view.setAccessibilityHelp("拖动选区内部移动，拖动边缘调整大小，Return 复制图片，Command Return 复制文字，Escape 取消。")
+        view.finish = { [weak self, weak view] action in
             guard let self, let view else { return }
             let region = view.selection.captureRect(desktop: desktop, mainScreenTop: mainScreen.frame.maxY)
             self.selectionWindow?.close()
             self.selectionWindow = nil
-            if rect != nil {
-                self.takeScreenshot(rect: region)
+            self.previousApplication?.activate(options: .activateIgnoringOtherApps)
+            self.previousApplication = nil
+            if let action {
+                self.takeScreenshot(rect: region, action: action)
             } else {
                 self.captureItem.isEnabled = true
             }
@@ -200,18 +255,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeFirstResponder(view)
     }
 
-    private func takeScreenshot(rect: CGRect) {
+    private func takeScreenshot(rect: CGRect, action: CaptureAction) {
+        var taskID: UUID?
+        var directory: URL?
+        if action == .text {
+            let id = UUID()
+            let destination = FileManager.default.temporaryDirectory.appendingPathComponent("Meowshot-\(id.uuidString)", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false,
+                                                        attributes: [.posixPermissions: 0o700])
+            } catch {
+                captureItem.isEnabled = true
+                return
+            }
+            directory = destination
+            temporaryDirectory = destination
+            taskID = id
+            textState.id = id
+            let result = RegisterEventHotKey(UInt32(kVK_Escape), 0, EventHotKeyID(signature: 0x4D454F57, id: 2),
+                                             GetApplicationEventTarget(), 0, &cancelHotKey)
+            if result != noErr {
+                try? FileManager.default.removeItem(at: destination)
+                temporaryDirectory = nil
+                finishTextCapture(id: id, text: nil)
+                return
+            }
+        }
+        let file = directory?.appendingPathComponent("capture.png")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        process.arguments = captureArguments(rect: rect)
+        process.arguments = captureArguments(rect: rect, file: file)
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         process.terminationHandler = { [weak self] process in
             DispatchQueue.main.async {
-                guard let self else { return }
+                defer {
+                    if let directory { try? FileManager.default.removeItem(at: directory) }
+                }
+                guard let self, self.capture === process else { return }
+                self.temporaryDirectory = nil
                 self.capture = nil
-                self.captureItem.isEnabled = true
-                if process.terminationStatus != 0 {
+                self.captureItem.isEnabled = self.textState.id == nil
+                if let taskID, let file {
+                    guard self.textState.id == taskID else { return }
+                    guard process.terminationStatus == 0,
+                          let source = CGImageSourceCreateWithURL(file as CFURL, nil),
+                          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                        self.finishTextCapture(id: taskID, text: nil)
+                        return
+                    }
+                    self.recognizeText(image, id: taskID)
+                } else if process.terminationStatus != 0 {
                     self.showError("未能将截图复制到剪贴板，请检查屏幕录制权限后重试。")
                 }
             }
@@ -220,13 +314,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         captureItem.isEnabled = false
         // Let the selection overlay disappear before capturing the display.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            guard self.capture === process else { return }
             do { try process.run() }
             catch {
+                if let directory { try? FileManager.default.removeItem(at: directory) }
+                self.temporaryDirectory = nil
                 self.capture = nil
                 self.captureItem.isEnabled = true
-                self.showError(error.localizedDescription)
+                if let taskID { self.finishTextCapture(id: taskID, text: nil) }
+                else { self.showError(error.localizedDescription) }
             }
         }
+    }
+
+    private func recognizeText(_ image: CGImage, id: UUID) {
+        let request = VNRecognizeTextRequest()
+        recognitionRequest = request
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let text = try recognizedText(in: image, request: request)
+                DispatchQueue.main.async { self.finishTextCapture(id: id, text: text) }
+            } catch {
+                DispatchQueue.main.async { self.finishTextCapture(id: id, text: nil) }
+            }
+        }
+    }
+
+    private func finishTextCapture(id: UUID, text: String?) {
+        guard textState.id == id else { return }
+        _ = textState.complete(id: id, text: text, pasteboard: .general)
+        recognitionRequest = nil
+        unregisterCancelHotKey()
+        captureItem.isEnabled = true
+    }
+
+    private func cancelTextCapture() {
+        guard textState.id != nil else { return }
+        textState.id = nil
+        recognitionRequest?.cancel()
+        recognitionRequest = nil
+        if let capture {
+            if capture.isRunning { capture.terminate() }
+            else {
+                self.capture = nil
+                if let temporaryDirectory { try? FileManager.default.removeItem(at: temporaryDirectory) }
+                temporaryDirectory = nil
+            }
+        }
+        unregisterCancelHotKey()
+        captureItem.isEnabled = capture == nil
+    }
+
+    private func unregisterCancelHotKey() {
+        if let cancelHotKey { UnregisterEventHotKey(cancelHotKey) }
+        cancelHotKey = nil
     }
 
     @objc private func openPermissions() {
@@ -234,7 +375,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func quitApp() {
-        capture?.terminate()
+        cancelTextCapture()
+        if let capture, capture.isRunning {
+            capture.terminate()
+            capture.waitUntilExit()
+        }
+        if let temporaryDirectory { try? FileManager.default.removeItem(at: temporaryDirectory) }
         NSApp.terminate(nil)
     }
 
@@ -248,6 +394,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 if CommandLine.arguments.contains("--self-test") {
+    precondition(CaptureAction.confirmation(keyCode: 36, modifiers: []) == .image)
+    precondition(CaptureAction.confirmation(keyCode: 36, modifiers: .command) == .text)
+    precondition(CaptureAction.confirmation(keyCode: 76, modifiers: .command) == .text)
+    precondition(CaptureAction.confirmation(keyCode: 53, modifiers: []) == nil)
+    let pasteboard = NSPasteboard.withUniqueName()
+    defer { pasteboard.releaseGlobally() }
+    pasteboard.setString("keep this", forType: .string)
+    var textState = TextCaptureState(id: UUID())
+    let cancelledID = textState.id!
+    textState.id = nil
+    precondition(!textState.complete(id: cancelledID, text: "late result", pasteboard: pasteboard))
+    textState.id = UUID()
+    precondition(!textState.complete(id: cancelledID, text: "old task", pasteboard: pasteboard))
+    precondition(!textState.complete(id: textState.id!, text: " \n", pasteboard: pasteboard))
+    textState.id = UUID()
+    precondition(!textState.complete(id: textState.id!, text: nil, pasteboard: pasteboard))
+    precondition(pasteboard.string(forType: .string) == "keep this")
+    textState.id = UUID()
+    precondition(textState.complete(id: textState.id!, text: "简体中文\n繁體中文 English", pasteboard: pasteboard))
+    precondition(pasteboard.string(forType: .string) == "简体中文\n繁體中文 English")
+    precondition(textState.id == nil)
+    let context = CGContext(data: nil, width: 800, height: 240, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    context.setFillColor(CGColor(gray: 1, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: 800, height: 240))
+    let blank = context.makeImage()!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+    let lines = ["Hello Meowshot", "简体中文截图", "繁體中文截圖"]
+    for (index, line) in lines.enumerated() {
+        (line as NSString).draw(at: CGPoint(x: 20, y: 175 - index * 70),
+                               withAttributes: [.font: NSFont.systemFont(ofSize: 40), .foregroundColor: NSColor.black])
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    do {
+        let text = try recognizedText(in: context.makeImage()!, request: VNRecognizeTextRequest())
+        for line in lines {
+            precondition(text.replacingOccurrences(of: " ", with: "").contains(line.replacingOccurrences(of: " ", with: "")),
+                         "OCR fixture missing \(line): \(text)")
+        }
+        precondition(text.contains("\n"), "OCR must retain line breaks")
+        let empty = try recognizedText(in: blank, request: VNRecognizeTextRequest())
+        precondition(empty.isEmpty)
+    } catch { fatalError("OCR fixture failed: \(error)") }
     var permission = CapturePermission()
     precondition(permission.action(granted: false) == .request)
     precondition(permission.action(granted: false) == .settings)
@@ -273,13 +463,15 @@ if CommandLine.arguments.contains("--self-test") {
     let region = selection.captureRect(desktop: CGRect(x: -1000, y: -200, width: 2000, height: 1000), mainScreenTop: 800)
     precondition(region == CGRect(x: -300, y: 200, width: 300, height: 400))
     precondition(captureArguments(rect: region) == ["-c", "-x", "-t", "png", "-R-300,200,300,400"])
+    let file = URL(fileURLWithPath: "/tmp/ocr capture.png")
+    precondition(captureArguments(rect: region, file: file) == ["-x", "-t", "png", "-R-300,200,300,400", file.path])
     selection.begin(at: CGPoint(x: 50, y: 50))
     precondition(selection.rect.isEmpty)
     selection.drag(to: CGPoint(x: 60, y: 60), within: bounds)
     selection.begin(at: CGPoint(x: 54, y: 55))
     selection.drag(to: CGPoint(x: 80, y: 30), within: bounds)
     precondition(selection.rect == CGRect(x: 60, y: 30, width: 20, height: 30), "Small selections must resize across the opposite edge")
-    print("PASS: permission flow, selection drawing/moving/resizing, screen coordinates and clipboard capture arguments")
+    print("PASS: permission flow, selection, coordinates, capture destinations, OCR actions and clipboard success/failure/cancellation")
 } else {
     let app = NSApplication.shared
     let delegate = AppDelegate()
