@@ -2,19 +2,104 @@ import AppKit
 import Carbon
 import UniformTypeIdentifiers
 
-enum CaptureMode: CaseIterable {
-    case region, window, screen
+struct RegionSelection {
+    var rect = CGRect.zero
+    private var initial = CGRect.zero
+    private var anchor = CGPoint.zero
+    private var moving = false
+    private var edges = [Bool](repeating: false, count: 4)
 
-    var arguments: [String] {
-        switch self {
-        case .region: return ["-i", "-s"]
-        case .window: return ["-i", "-w"]
-        case .screen: return ["-m"]
+    mutating func begin(at point: CGPoint) {
+        initial = rect
+        anchor = point
+        let near = rect.insetBy(dx: -8, dy: -8).contains(point)
+        edges = [abs(point.x - rect.minX) < 8, abs(point.x - rect.maxX) < 8,
+                 abs(point.y - rect.minY) < 8, abs(point.y - rect.maxY) < 8].map { $0 && near && !rect.isEmpty }
+        if edges[0] && edges[1] { edges[0] = point.x <= rect.midX; edges[1] = !edges[0] }
+        if edges[2] && edges[3] { edges[2] = point.y <= rect.midY; edges[3] = !edges[2] }
+        moving = !rect.isEmpty && !edges.contains(true) && rect.contains(point)
+        if !moving && !edges.contains(true) { rect = .zero }
+    }
+
+    mutating func drag(to point: CGPoint, within bounds: CGRect) {
+        let point = CGPoint(x: min(max(point.x, bounds.minX), bounds.maxX),
+                            y: min(max(point.y, bounds.minY), bounds.maxY))
+        if moving {
+            rect.origin = CGPoint(x: min(max(initial.minX + point.x - anchor.x, bounds.minX), bounds.maxX - initial.width),
+                                  y: min(max(initial.minY + point.y - anchor.y, bounds.minY), bounds.maxY - initial.height))
+        } else {
+            let resizing = edges.contains(true)
+            let x1 = resizing ? (edges[0] ? point.x : initial.minX) : anchor.x
+            let x2 = resizing ? (edges[1] ? point.x : initial.maxX) : point.x
+            let y1 = resizing ? (edges[2] ? point.y : initial.minY) : anchor.y
+            let y2 = resizing ? (edges[3] ? point.y : initial.maxY) : point.y
+            rect = CGRect(x: min(x1, x2), y: min(y1, y2), width: abs(x2 - x1), height: abs(y2 - y1))
         }
     }
 
-    func command(output: URL) -> [String] {
-        ["-x", "-t", "png"] + arguments + [output.path]
+    func captureRect(desktop: CGRect, mainScreenTop: CGFloat) -> CGRect {
+        CGRect(x: desktop.minX + rect.minX, y: mainScreenTop - desktop.minY - rect.maxY,
+               width: rect.width, height: rect.height).integral
+    }
+}
+
+func captureArguments(rect: CGRect, output: URL) -> [String] {
+    ["-x", "-t", "png", "-R\(Int(rect.minX)),\(Int(rect.minY)),\(Int(rect.width)),\(Int(rect.height))", output.path]
+}
+
+final class SelectionWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+}
+
+final class SelectionView: NSView {
+    var selection = RegionSelection()
+    var finish: ((CGRect?) -> Void)?
+    var hintOrigin = CGPoint.zero
+    override var acceptsFirstResponder: Bool { true }
+
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let shade = NSBezierPath(rect: bounds)
+        shade.appendRect(selection.rect)
+        shade.windingRule = .evenOdd
+        NSColor.black.withAlphaComponent(0.35).setFill()
+        shade.fill()
+        if !selection.rect.isEmpty {
+            NSColor.white.setStroke()
+            NSBezierPath(rect: selection.rect).stroke()
+            NSColor.white.setFill()
+            for x in [selection.rect.minX, selection.rect.midX, selection.rect.maxX] {
+                for y in [selection.rect.minY, selection.rect.midY, selection.rect.maxY] {
+                    if x == selection.rect.midX && y == selection.rect.midY { continue }
+                    NSBezierPath(rect: NSRect(x: x - 3, y: y - 3, width: 6, height: 6)).fill()
+                }
+            }
+        }
+        let hint = "拖拽框选 · 拖动内部移动 · 拖动边缘调整 · Enter 确认 · Esc 取消"
+        (hint as NSString).draw(at: hintOrigin, withAttributes: [
+            .font: NSFont.systemFont(ofSize: 14), .foregroundColor: NSColor.white,
+            .backgroundColor: NSColor.black.withAlphaComponent(0.7)
+        ])
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        selection.begin(at: convert(event.locationInWindow, from: nil))
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        selection.drag(to: convert(event.locationInWindow, from: nil), within: bounds)
+        needsDisplay = true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 53: finish?(nil)
+        case 36, 76:
+            if selection.rect.width >= 1 && selection.rect.height >= 1 { finish?(selection.rect) }
+        default: break
+        }
     }
 }
 
@@ -36,7 +121,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var capture: Process?
     private var preview: NSWindow?
     private var imageData: Data?
-    private var captureItems: [NSMenuItem] = []
+    private var captureItem: NSMenuItem!
+    private var selectionWindow: NSWindow?
     private var permission = CapturePermission()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -44,16 +130,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "Meowshot 截屏")
         statusItem.button?.toolTip = "Meowshot · ⌘⇧X 截屏"
         let menu = NSMenu()
-        for (title, action) in [
-            ("区域截屏    ⌘⇧X", #selector(captureRegion)),
-            ("窗口截屏", #selector(captureWindow)),
-            ("全屏截屏（主显示器）", #selector(captureScreen))
-        ] {
-            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-            item.target = self
-            menu.addItem(item)
-            captureItems.append(item)
-        }
+        captureItem = NSMenuItem(title: "区域截屏    ⌘⇧X", action: #selector(captureRegion), keyEquivalent: "")
+        captureItem.target = self
+        menu.addItem(captureItem)
         menu.autoenablesItems = false
         menu.addItem(.separator())
         let permission = NSMenuItem(title: "屏幕录制权限设置…", action: #selector(openPermissions), keyEquivalent: "")
@@ -76,17 +155,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                         EventHotKeyID(signature: 0x4D454F57, id: 1),
                                         GetApplicationEventTarget(), 0, &hotKey)
         if result != noErr {
-            captureItems[0].title = "区域截屏（快捷键被占用）"
+            captureItem.title = "区域截屏（快捷键被占用）"
             showError("⌘⇧X 注册失败，请使用菜单栏开始截屏。")
         }
     }
 
-    @objc private func captureRegion() { startCapture(.region) }
-    @objc private func captureWindow() { startCapture(.window) }
-    @objc private func captureScreen() { startCapture(.screen) }
-
-    private func startCapture(_ mode: CaptureMode) {
-        guard capture == nil else { return }
+    @objc private func captureRegion() {
+        guard capture == nil, selectionWindow == nil else { return }
         switch permission.action(granted: CGPreflightScreenCaptureAccess()) {
         case .capture:
             break
@@ -104,10 +179,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         preview?.orderOut(nil)
+        guard let mainScreen = NSScreen.screens.first else { return }
+        let desktop = NSScreen.screens.reduce(CGRect.null) { $0.union($1.frame) }
+        let window = SelectionWindow(contentRect: desktop, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.level = .screenSaver
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let view = SelectionView(frame: CGRect(origin: .zero, size: desktop.size))
+        let activeScreen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? mainScreen
+        view.hintOrigin = CGPoint(x: activeScreen.frame.minX - desktop.minX + 24,
+                                  y: activeScreen.frame.maxY - desktop.minY - 60)
+        view.setAccessibilityLabel("截图选区")
+        view.setAccessibilityHelp("拖动选区内部移动，拖动边缘调整大小，按 Return 确认，Escape 取消。")
+        view.finish = { [weak self, weak view] rect in
+            guard let self, let view else { return }
+            let region = view.selection.captureRect(desktop: desktop, mainScreenTop: mainScreen.frame.maxY)
+            self.selectionWindow?.close()
+            self.selectionWindow = nil
+            if rect != nil {
+                self.takeScreenshot(rect: region)
+            } else {
+                self.captureItem.isEnabled = true
+                self.preview?.makeKeyAndOrderFront(nil)
+            }
+        }
+        window.contentView = view
+        selectionWindow = window
+        captureItem.isEnabled = false
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(view)
+    }
+
+    private func takeScreenshot(rect: CGRect) {
         let output = FileManager.default.temporaryDirectory.appendingPathComponent("Meowshot-\(UUID().uuidString).png")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        process.arguments = mode.command(output: output)
+        process.arguments = captureArguments(rect: rect, output: output)
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         process.terminationHandler = { [weak self] process in
@@ -115,26 +226,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 defer { try? FileManager.default.removeItem(at: output) }
                 self.capture = nil
-                self.captureItems.forEach { $0.isEnabled = true }
+                self.captureItem.isEnabled = true
                 if let data = try? Data(contentsOf: output), let image = NSImage(data: data) {
                     self.imageData = data
                     self.showPreview(image)
-                } else if mode == .screen || FileManager.default.fileExists(atPath: output.path) {
-                    self.showError("未能获取截图，请检查屏幕录制权限后重试。")
                 } else {
-                    // screencapture produces no file when an interactive capture is cancelled.
-                    self.preview?.makeKeyAndOrderFront(nil)
+                    self.showError("未能获取截图，请检查屏幕录制权限后重试。")
                 }
             }
         }
         capture = process
-        captureItems.forEach { $0.isEnabled = false }
-        // Let the menu and preview disappear before capturing the display.
+        captureItem.isEnabled = false
+        // Let the selection overlay disappear before capturing the display.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
             do { try process.run() }
             catch {
                 self.capture = nil
-                self.captureItems.forEach { $0.isEnabled = true }
+                self.captureItem.isEnabled = true
                 self.showError(error.localizedDescription)
             }
         }
@@ -229,15 +337,30 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(authorized.action(granted: true) == .capture)
     precondition(authorized.action(granted: false) == .request)
     let output = URL(fileURLWithPath: "/tmp/screenshot with spaces.png")
-    for mode in CaptureMode.allCases {
-        let command = mode.command(output: output)
-        precondition(command.last == output.path, "Output must remain a single argument")
-        precondition(command.prefix(3) == ["-x", "-t", "png"])
-    }
-    precondition(CaptureMode.region.command(output: output) == ["-x", "-t", "png", "-i", "-s", output.path])
-    precondition(CaptureMode.window.command(output: output) == ["-x", "-t", "png", "-i", "-w", output.path])
-    precondition(CaptureMode.screen.command(output: output) == ["-x", "-t", "png", "-m", output.path])
-    print("PASS: permission flow, screenshot modes and output paths")
+    let bounds = CGRect(x: 0, y: 0, width: 1000, height: 800)
+    var selection = RegionSelection()
+    selection.begin(at: CGPoint(x: 300, y: 300))
+    selection.drag(to: CGPoint(x: 100, y: 100), within: bounds)
+    precondition(selection.rect == CGRect(x: 100, y: 100, width: 200, height: 200))
+    selection.begin(at: CGPoint(x: 200, y: 200))
+    selection.drag(to: CGPoint(x: 1200, y: 900), within: bounds)
+    precondition(selection.rect == CGRect(x: 800, y: 600, width: 200, height: 200))
+    selection.begin(at: CGPoint(x: 800, y: 600))
+    selection.drag(to: CGPoint(x: 700, y: 500), within: bounds)
+    precondition(selection.rect == CGRect(x: 700, y: 500, width: 300, height: 300))
+    selection.begin(at: CGPoint(x: 850, y: 500))
+    selection.drag(to: CGPoint(x: 850, y: 400), within: bounds)
+    precondition(selection.rect == CGRect(x: 700, y: 400, width: 300, height: 400))
+    let region = selection.captureRect(desktop: CGRect(x: -1000, y: -200, width: 2000, height: 1000), mainScreenTop: 800)
+    precondition(region == CGRect(x: -300, y: 200, width: 300, height: 400))
+    precondition(captureArguments(rect: region, output: output) == ["-x", "-t", "png", "-R-300,200,300,400", output.path])
+    selection.begin(at: CGPoint(x: 50, y: 50))
+    precondition(selection.rect.isEmpty)
+    selection.drag(to: CGPoint(x: 60, y: 60), within: bounds)
+    selection.begin(at: CGPoint(x: 54, y: 55))
+    selection.drag(to: CGPoint(x: 80, y: 30), within: bounds)
+    precondition(selection.rect == CGRect(x: 60, y: 30, width: 20, height: 30), "Small selections must resize across the opposite edge")
+    print("PASS: permission flow, selection drawing/moving/resizing, screen coordinates and capture arguments")
 } else {
     let app = NSApplication.shared
     let delegate = AppDelegate()
