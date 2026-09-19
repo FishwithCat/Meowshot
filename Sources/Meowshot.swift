@@ -1,7 +1,6 @@
 import AppKit
 import Carbon
 import Vision
-import ImageIO
 
 enum CaptureAction {
     case image, text
@@ -69,15 +68,13 @@ struct RegionSelection {
         }
     }
 
-    func captureRect(desktop: CGRect, mainScreenTop: CGFloat) -> CGRect {
-        CGRect(x: desktop.minX + rect.minX, y: mainScreenTop - desktop.minY - rect.maxY,
-               width: rect.width, height: rect.height).integral
+    func croppedImage(from image: CGImage, desktopSize: CGSize) -> CGImage? {
+        let scaleX = CGFloat(image.width) / desktopSize.width
+        let scaleY = CGFloat(image.height) / desktopSize.height
+        let pixels = CGRect(x: rect.minX * scaleX, y: (desktopSize.height - rect.maxY) * scaleY,
+                            width: rect.width * scaleX, height: rect.height * scaleY).integral
+        return image.cropping(to: pixels)
     }
-}
-
-func captureArguments(rect: CGRect, file: URL? = nil) -> [String] {
-    (file == nil ? ["-c"] : []) + ["-x", "-t", "png", "-R\(Int(rect.minX)),\(Int(rect.minY)),\(Int(rect.width)),\(Int(rect.height))"]
-        + (file.map { [$0.path] } ?? [])
 }
 
 final class SelectionWindow: NSWindow {
@@ -94,6 +91,7 @@ final class SelectionWindow: NSWindow {
 }
 
 final class SelectionView: NSView {
+    var snapshot: NSImage?
     var selection = RegionSelection()
     var finish: ((CaptureAction?) -> Void)?
     override var acceptsFirstResponder: Bool { true }
@@ -101,6 +99,7 @@ final class SelectionView: NSView {
     override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
 
     override func draw(_ dirtyRect: NSRect) {
+        snapshot?.draw(in: bounds, from: .zero, operation: .copy, fraction: 1)
         let shade = NSBezierPath(rect: bounds)
         shade.appendRect(selection.rect)
         shade.windingRule = .evenOdd
@@ -151,14 +150,12 @@ struct CapturePermission {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var hotKey: EventHotKeyRef?
-    private var capture: Process?
     private var captureItem: NSMenuItem!
     private var selectionWindow: NSWindow?
     private var permission = CapturePermission()
     private var textState = TextCaptureState()
     private var recognitionRequest: VNRecognizeTextRequest?
     private var cancelHotKey: EventHotKeyRef?
-    private var temporaryDirectory: URL?
     private var previousApplication: NSRunningApplication?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -204,7 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func captureRegion() {
-        guard capture == nil, selectionWindow == nil, textState.id == nil else { return }
+        guard selectionWindow == nil, textState.id == nil else { return }
         switch permission.action(granted: CGPreflightScreenCaptureAccess()) {
         case .capture:
             break
@@ -222,29 +219,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         guard let mainScreen = NSScreen.screens.first else { return }
-        previousApplication = NSWorkspace.shared.frontmostApplication
         let desktop = NSScreen.screens.reduce(CGRect.null) { $0.union($1.frame) }
+        let captureBounds = CGRect(x: desktop.minX, y: mainScreen.frame.maxY - desktop.maxY,
+                                   width: desktop.width, height: desktop.height)
+        guard let snapshot = CGWindowListCreateImage(captureBounds, .optionOnScreenOnly,
+                                                     kCGNullWindowID, .bestResolution) else {
+            showError("未能截取屏幕，请检查屏幕录制权限后重试。")
+            return
+        }
+        previousApplication = NSWorkspace.shared.frontmostApplication
         let window = SelectionWindow(contentRect: desktop, styleMask: .borderless, backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
-        window.isOpaque = false
-        window.backgroundColor = .clear
+        window.isOpaque = true
+        window.backgroundColor = .black
         window.hasShadow = false
         window.level = .screenSaver
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         let view = SelectionView(frame: CGRect(origin: .zero, size: desktop.size))
+        view.snapshot = NSImage(cgImage: snapshot, size: desktop.size)
         view.setAccessibilityLabel("截图选区")
         view.setAccessibilityHelp("拖动选区内部移动，拖动边缘调整大小，Return 复制图片，Command Return 复制文字，Escape 取消。")
         view.finish = { [weak self, weak view] action in
             guard let self, let view else { return }
-            let region = view.selection.captureRect(desktop: desktop, mainScreenTop: mainScreen.frame.maxY)
             self.selectionWindow?.close()
             self.selectionWindow = nil
             self.previousApplication?.activate(options: .activateIgnoringOtherApps)
             self.previousApplication = nil
-            if let action {
-                self.takeScreenshot(rect: region, action: action)
-            } else {
-                self.captureItem.isEnabled = true
+            self.captureItem.isEnabled = true
+            if let action, let image = view.selection.croppedImage(from: snapshot, desktopSize: desktop.size) {
+                self.takeScreenshot(image: image, action: action)
             }
         }
         window.contentView = view
@@ -255,76 +258,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeFirstResponder(view)
     }
 
-    private func takeScreenshot(rect: CGRect, action: CaptureAction) {
-        var taskID: UUID?
-        var directory: URL?
-        if action == .text {
-            let id = UUID()
-            let destination = FileManager.default.temporaryDirectory.appendingPathComponent("Meowshot-\(id.uuidString)", isDirectory: true)
-            do {
-                try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false,
-                                                        attributes: [.posixPermissions: 0o700])
-            } catch {
-                captureItem.isEnabled = true
-                return
+    private func takeScreenshot(image: CGImage, action: CaptureAction) {
+        if action == .image {
+            let item = NSPasteboardItem()
+            guard let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]),
+                  item.setData(data, forType: .png) else { return }
+            NSPasteboard.general.clearContents()
+            if !NSPasteboard.general.writeObjects([item]) {
+                showError("未能将截图复制到剪贴板，请重试。")
             }
-            directory = destination
-            temporaryDirectory = destination
-            taskID = id
-            textState.id = id
-            let result = RegisterEventHotKey(UInt32(kVK_Escape), 0, EventHotKeyID(signature: 0x4D454F57, id: 2),
-                                             GetApplicationEventTarget(), 0, &cancelHotKey)
-            if result != noErr {
-                try? FileManager.default.removeItem(at: destination)
-                temporaryDirectory = nil
-                finishTextCapture(id: id, text: nil)
-                return
-            }
+            return
         }
-        let file = directory?.appendingPathComponent("capture.png")
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        process.arguments = captureArguments(rect: rect, file: file)
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        process.terminationHandler = { [weak self] process in
-            DispatchQueue.main.async {
-                defer {
-                    if let directory { try? FileManager.default.removeItem(at: directory) }
-                }
-                guard let self, self.capture === process else { return }
-                self.temporaryDirectory = nil
-                self.capture = nil
-                self.captureItem.isEnabled = self.textState.id == nil
-                if let taskID, let file {
-                    guard self.textState.id == taskID else { return }
-                    guard process.terminationStatus == 0,
-                          let source = CGImageSourceCreateWithURL(file as CFURL, nil),
-                          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-                        self.finishTextCapture(id: taskID, text: nil)
-                        return
-                    }
-                    self.recognizeText(image, id: taskID)
-                } else if process.terminationStatus != 0 {
-                    self.showError("未能将截图复制到剪贴板，请检查屏幕录制权限后重试。")
-                }
-            }
+        let id = UUID()
+        textState.id = id
+        let result = RegisterEventHotKey(UInt32(kVK_Escape), 0, EventHotKeyID(signature: 0x4D454F57, id: 2),
+                                         GetApplicationEventTarget(), 0, &cancelHotKey)
+        guard result == noErr else {
+            finishTextCapture(id: id, text: nil)
+            return
         }
-        capture = process
         captureItem.isEnabled = false
-        // Let the selection overlay disappear before capturing the display.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-            guard self.capture === process else { return }
-            do { try process.run() }
-            catch {
-                if let directory { try? FileManager.default.removeItem(at: directory) }
-                self.temporaryDirectory = nil
-                self.capture = nil
-                self.captureItem.isEnabled = true
-                if let taskID { self.finishTextCapture(id: taskID, text: nil) }
-                else { self.showError(error.localizedDescription) }
-            }
-        }
+        recognizeText(image, id: id)
     }
 
     private func recognizeText(_ image: CGImage, id: UUID) {
@@ -353,16 +307,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         textState.id = nil
         recognitionRequest?.cancel()
         recognitionRequest = nil
-        if let capture {
-            if capture.isRunning { capture.terminate() }
-            else {
-                self.capture = nil
-                if let temporaryDirectory { try? FileManager.default.removeItem(at: temporaryDirectory) }
-                temporaryDirectory = nil
-            }
-        }
         unregisterCancelHotKey()
-        captureItem.isEnabled = capture == nil
+        captureItem.isEnabled = true
     }
 
     private func unregisterCancelHotKey() {
@@ -376,11 +322,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitApp() {
         cancelTextCapture()
-        if let capture, capture.isRunning {
-            capture.terminate()
-            capture.waitUntilExit()
-        }
-        if let temporaryDirectory { try? FileManager.default.removeItem(at: temporaryDirectory) }
         NSApp.terminate(nil)
     }
 
@@ -460,18 +401,37 @@ if CommandLine.arguments.contains("--self-test") {
     selection.begin(at: CGPoint(x: 850, y: 500))
     selection.drag(to: CGPoint(x: 850, y: 400), within: bounds)
     precondition(selection.rect == CGRect(x: 700, y: 400, width: 300, height: 400))
-    let region = selection.captureRect(desktop: CGRect(x: -1000, y: -200, width: 2000, height: 1000), mainScreenTop: 800)
-    precondition(region == CGRect(x: -300, y: 200, width: 300, height: 400))
-    precondition(captureArguments(rect: region) == ["-c", "-x", "-t", "png", "-R-300,200,300,400"])
-    let file = URL(fileURLWithPath: "/tmp/ocr capture.png")
-    precondition(captureArguments(rect: region, file: file) == ["-x", "-t", "png", "-R-300,200,300,400", file.path])
+    let cropContext = CGContext(data: nil, width: 2000, height: 1600, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    cropContext.setFillColor(CGColor(gray: 1, alpha: 1))
+    cropContext.fill(CGRect(x: 1400, y: 800, width: 600, height: 800))
+    let frozen = cropContext.makeImage()!
+    // Mutating the source after capture must not change the selected frame.
+    cropContext.setFillColor(CGColor(gray: 0, alpha: 1))
+    cropContext.fill(CGRect(x: 0, y: 0, width: 2000, height: 1600))
+    let crop = selection.croppedImage(from: frozen, desktopSize: bounds.size)!
+    precondition(crop.width == 600 && crop.height == 800, "Crop must preserve Retina pixels")
+    let pixels = crop.dataProvider!.data! as Data
+    precondition(pixels[0] == 255 && pixels[1] == 255 && pixels[2] == 255,
+                 "Crop must use the frozen frame and convert bottom-left selection coordinates")
+    let preview = SelectionView(frame: bounds)
+    preview.snapshot = NSImage(cgImage: frozen, size: bounds.size)
+    preview.selection = selection
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(cgContext: cropContext, flipped: false)
+    cropContext.scaleBy(x: 2, y: 2)
+    preview.draw(bounds)
+    NSGraphicsContext.restoreGraphicsState()
+    let rendered = NSBitmapImageRep(cgImage: cropContext.makeImage()!)
+    precondition(rendered.colorAt(x: 1700, y: 400)!.usingColorSpace(.deviceRGB)!.redComponent > 0.99,
+                 "The selection interior must display the frozen image instead of the live desktop")
     selection.begin(at: CGPoint(x: 50, y: 50))
     precondition(selection.rect.isEmpty)
     selection.drag(to: CGPoint(x: 60, y: 60), within: bounds)
     selection.begin(at: CGPoint(x: 54, y: 55))
     selection.drag(to: CGPoint(x: 80, y: 30), within: bounds)
     precondition(selection.rect == CGRect(x: 60, y: 30, width: 20, height: 30), "Small selections must resize across the opposite edge")
-    print("PASS: permission flow, selection, coordinates, capture destinations, OCR actions and clipboard success/failure/cancellation")
+    print("PASS: permission flow, selection, frozen Retina crop, OCR actions and clipboard success/failure/cancellation")
 } else {
     let app = NSApplication.shared
     let delegate = AppDelegate()
