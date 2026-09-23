@@ -128,6 +128,12 @@ final class SelectionView: NSView {
         needsDisplay = true
     }
 
+    override func mouseUp(with event: NSEvent) {
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKey()
+        window?.makeFirstResponder(self)
+    }
+
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { finish?(nil) }
         else if let action = CaptureAction.confirmation(keyCode: event.keyCode, modifiers: event.modifierFlags),
