@@ -148,6 +148,11 @@ final class SelectionWindow: NSWindow {
             contentView?.keyDown(with: event)
             return true
         }
+        if event.modifierFlags.contains(.command), !event.modifierFlags.contains(.shift),
+           event.keyCode == UInt16(kVK_ANSI_Z),
+           let view = contentView as? SelectionView, view.undoAnnotation() {
+            return true
+        }
         return super.performKeyEquivalent(with: event)
     }
 }
@@ -168,6 +173,10 @@ final class ToolButton: NSButton {
 
 final class ToolbarView: NSView {
     var onSelect: ((AnnotationTool?) -> Void)?
+    var onClear: (() -> Void)?
+    var canClear = false {
+        didSet { clearButton?.alphaValue = canClear ? 1 : 0.45 }
+    }
     private(set) var chosenTool: AnnotationTool? {
         didSet {
             for (index, button) in buttons.enumerated() { button.isChosen = tools[index] == chosenTool }
@@ -175,9 +184,10 @@ final class ToolbarView: NSView {
     }
     private let tools: [AnnotationTool?] = [nil, .rectangle, .arrow, .text]
     private var buttons: [ToolButton] = []
+    private var clearButton: ToolButton?
 
     override init(frame frameRect: NSRect) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 216, height: 34))
+        super.init(frame: NSRect(x: 0, y: 0, width: 276, height: 34))
         let titles = ["鼠标", "框选", "箭头", "文字"]
         let tips = ["调整截图范围（拖动内部移动，拖动边缘缩放）", "绘制矩形框", "绘制箭头", "输入文字"]
         for index in titles.indices {
@@ -197,8 +207,25 @@ final class ToolbarView: NSView {
             addSubview(button)
             buttons.append(button)
         }
+        let clear = ToolButton(frame: NSRect(x: 220, y: 3, width: 52, height: 28))
+        clear.isBordered = false
+        clear.focusRingType = .none
+        clear.setButtonType(.momentaryChange)
+        clear.target = self
+        clear.action = #selector(clearAll(_:))
+        clear.attributedTitle = NSAttributedString(string: "清除", attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+            .foregroundColor: NSColor.white
+        ])
+        clear.toolTip = "清除全部标注（⌘Z 可撤销）"
+        clear.setAccessibilityLabel("清除全部标注")
+        // Keep it enabled: a disabled button lets the click fall through to SelectionView and reset the selection.
+        clear.isEnabled = true
+        clear.alphaValue = 0.45
+        addSubview(clear)
+        clearButton = clear
         setAccessibilityLabel("标注工具")
-        setAccessibilityHelp("鼠标模式可移动和缩放选区，标注工具用于绘制。")
+        setAccessibilityHelp("鼠标模式可移动和缩放选区，标注工具用于绘制，清除按钮清空全部标注。")
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -216,17 +243,24 @@ final class ToolbarView: NSView {
         chosenTool = tools[sender.tag]
         onSelect?(chosenTool)
     }
+
+    @objc private func clearAll(_ sender: ToolButton) {
+        onClear?()
+    }
 }
 
 final class SelectionView: NSView, NSTextFieldDelegate {
     var snapshot: NSImage?
     var selection = RegionSelection()
-    var annotations: [Annotation] = []
+    var annotations: [Annotation] = [] {
+        didSet { toolbar.canClear = !annotations.isEmpty }
+    }
     var finish: ((CaptureAction?) -> Void)?
     private(set) var tool: AnnotationTool?
     private var pendingShape: (kind: AnnotationTool, start: CGPoint, end: CGPoint)?
     private var adjustingSelection = false
     private var textField: NSTextField?
+    private var annotationHistory: [[Annotation]] = []
     private lazy var toolbar = ToolbarView(frame: .zero)
 
     override var acceptsFirstResponder: Bool { true }
@@ -234,6 +268,7 @@ final class SelectionView: NSView, NSTextFieldDelegate {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         toolbar.onSelect = { [weak self] tool in self?.select(tool) }
+        toolbar.onClear = { [weak self] in self?.clearAnnotations() }
         addSubview(toolbar)
     }
 
@@ -283,6 +318,7 @@ final class SelectionView: NSView, NSTextFieldDelegate {
         selection.begin(at: point)
         pendingShape = nil
         if selection.rect.isEmpty {
+            if !annotations.isEmpty { recordAnnotations() }
             annotations.removeAll()
             adjustingSelection = true
         } else if tool == nil {
@@ -319,10 +355,12 @@ final class SelectionView: NSView, NSTextFieldDelegate {
             switch shape.kind {
             case .rectangle:
                 if abs(shape.end.x - shape.start.x) >= 4, abs(shape.end.y - shape.start.y) >= 4 {
+                    recordAnnotations()
                     annotations.append(.rectangle(from: shape.start, to: shape.end))
                 }
             case .arrow:
                 if hypot(shape.end.x - shape.start.x, shape.end.y - shape.start.y) >= 4 {
+                    recordAnnotations()
                     annotations.append(.arrow(from: shape.start, to: shape.end))
                 }
             case .text:
@@ -352,6 +390,29 @@ final class SelectionView: NSView, NSTextFieldDelegate {
         window?.makeFirstResponder(self)
         layoutToolbar()
         needsDisplay = true
+    }
+
+    @discardableResult
+    func undoAnnotation() -> Bool {
+        guard let previous = annotationHistory.popLast() else { return false }
+        annotations = previous
+        needsDisplay = true
+        window?.makeFirstResponder(self)
+        return true
+    }
+
+    func clearAnnotations() {
+        commitText()
+        window?.makeFirstResponder(self)
+        guard !annotations.isEmpty else { return }
+        recordAnnotations()
+        annotations.removeAll()
+        needsDisplay = true
+    }
+
+    private func recordAnnotations() {
+        annotationHistory.append(annotations)
+        if annotationHistory.count > 20 { annotationHistory.removeFirst() }
     }
 
     private func layoutToolbar() {
@@ -395,7 +456,10 @@ final class SelectionView: NSView, NSTextFieldDelegate {
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let origin = field.frame.origin
         field.removeFromSuperview()
-        if !text.isEmpty { annotations.append(.text(text, at: origin)) }
+        if !text.isEmpty {
+            recordAnnotations()
+            annotations.append(.text(text, at: origin))
+        }
         window?.makeFirstResponder(self)
         needsDisplay = true
     }
@@ -534,7 +598,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let view = SelectionView(frame: CGRect(origin: .zero, size: desktop.size))
         view.snapshot = NSImage(cgImage: snapshot, size: desktop.size)
         view.setAccessibilityLabel("截图选区")
-        view.setAccessibilityHelp("拖动选区内部移动，拖动边缘调整大小。工具条可切回鼠标调整选区，或绘制矩形框、箭头和文字。Return 复制图片，Command Return 复制文字，Escape 取消。")
+        view.setAccessibilityHelp("拖动选区内部移动，拖动边缘调整大小。工具条可切回鼠标调整选区，或绘制矩形框、箭头和文字；清除按钮删除全部标注，Command Z 撤销上一笔。Return 复制图片，Command Return 复制文字，Escape 取消。")
         view.finish = { [weak self, weak view] action in
             guard let self, let view else { return }
             self.selectionWindow?.close()
@@ -716,6 +780,21 @@ if CommandLine.arguments.contains("--self-test") {
     let preview = SelectionView(frame: bounds)
     preview.snapshot = NSImage(cgImage: frozen, size: bounds.size)
     preview.selection = selection
+    let keptSelection = preview.selection.rect
+    preview.annotations = [.arrow(from: CGPoint(x: 20, y: 30), to: CGPoint(x: 55, y: 30))]
+    preview.clearAnnotations()
+    precondition(preview.annotations.isEmpty, "Clear must remove all annotations")
+    precondition(preview.selection.rect == keptSelection, "Clear must keep the selection")
+    precondition(preview.undoAnnotation(), "Undo must restore cleared annotations")
+    precondition(preview.annotations.count == 1)
+    precondition(!preview.undoAnnotation(), "Undo must stop at the first recorded state")
+    preview.annotations = []
+    preview.clearAnnotations()
+    precondition(!preview.undoAnnotation(), "Clearing nothing must not add undo history")
+    let toolbar = ToolbarView(frame: .zero)
+    let clearButton = toolbar.subviews.compactMap { $0 as? NSButton }.first { $0.attributedTitle.string == "清除" }
+    precondition(clearButton?.isEnabled == true,
+                 "The clear button must stay enabled so a click cannot fall through to the selection")
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = NSGraphicsContext(cgContext: cropContext, flipped: false)
     cropContext.scaleBy(x: 2, y: 2)
@@ -781,7 +860,7 @@ if CommandLine.arguments.contains("--self-test") {
         from: annotationSource, desktopSize: desktopSize,
         annotations: [.arrow(from: CGPoint(x: 70, y: 70), to: CGPoint(x: 90, y: 90))])!
     precondition(redPixelCount(outsideImage) == 0, "Annotations outside the selection must be clipped")
-    print("PASS: permission flow, selection, frozen Retina crop, rectangle/arrow/text annotations, OCR actions and clipboard success/failure/cancellation")
+    print("PASS: permission flow, selection, frozen Retina crop, rectangle/arrow/text annotations, annotation undo/clear, OCR actions and clipboard success/failure/cancellation")
 } else {
     let app = NSApplication.shared
     let delegate = AppDelegate()
