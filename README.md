@@ -13,9 +13,13 @@ bash build.sh --run
 - OCR 在本机通过系统 Vision 识别简体中文、繁体中文和英文，复制全部纯文本并保留识别到的换行，不还原段落或表格。识别中可按 `Esc` 取消；不显示操作说明、识别状态或结果提示。无文字、识别失败或取消均保留原剪贴板。
 - 首次截屏需在系统设置中允许 Meowshot 录制屏幕，再重新启动 App。
 
-请固定使用同一路径下的 App。构建脚本会复用未修改的构建，避免重复签名。默认使用临时签名，修改代码并重新构建后可能需要重新授权：退出 Meowshot，在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」中移除旧的 Meowshot，再用 `+` 添加当前 `.build/Meowshot.app`（或你实际使用的应用程序目录中的副本），开启权限后重新打开。
+请固定使用同一路径下的 App。构建脚本会复用未修改的构建，避免重复签名。
 
-若本机有代码签名证书，可用 `CODE_SIGN_IDENTITY="证书名称或 SHA-1" bash build.sh --run` 构建；后续构建保持使用同一证书，有助于保留授权。可用 `security find-identity -v -p codesigning` 查看可用证书。没有证书时，临时签名无法保证跨版本保留授权。
+屏幕录制授权按代码签名锚定。首次构建前先运行一次 `bash scripts/setup-signing.sh`，生成并导入本地自签名证书 `Meowshot Local Signing`（有效期 10 年，幂等）；之后构建默认用该证书签名，重新构建不需要重新授权。证书名可用 `MEOWSHOT_SIGNING_CN`（setup 脚本）或 `MEOWSHOT_SIGNING_IDENTITY`（构建脚本）覆盖。
+
+切换签名后系统视其为新 App：退出 Meowshot，在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」中移除旧的 Meowshot，再用 `+` 添加当前 `.build/Meowshot.app`（或你实际使用的应用程序目录中的副本），开启权限后重新打开。
+
+也可用 `CODE_SIGN_IDENTITY="证书名称或 SHA-1" bash build.sh --run` 指定其他证书；可用 `security find-identity -v -p codesigning` 查看。没有任何证书时回退到临时（ad-hoc）签名，其授权在重新构建后不保留。
 
 复制图片或成功识别文字会替换剪贴板内容；需要保留的内容请先粘贴到其他应用保存。图片复制和 OCR 均使用开始截图时保存在内存中的静态画面。不保留截图文件，不上传任何内容。
 
