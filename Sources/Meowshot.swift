@@ -187,36 +187,38 @@ final class ToolbarView: NSView {
     private var clearButton: ToolButton?
 
     override init(frame frameRect: NSRect) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 276, height: 34))
-        let titles = ["鼠标", "框选", "箭头", "文字"]
+        super.init(frame: NSRect(x: 0, y: 0, width: 190, height: 34))
+        let names = ["鼠标", "框选", "箭头", "文字"]
+        let symbols = ["cursorarrow", "rectangle", "arrow.up.right", "textformat"]
         let tips = ["调整截图范围（拖动内部移动，拖动边缘缩放）", "绘制矩形框", "绘制箭头", "输入文字"]
-        for index in titles.indices {
-            let button = ToolButton(frame: NSRect(x: 4 + index * 52, y: 3, width: 52, height: 28))
+        for index in names.indices {
+            let button = ToolButton(frame: NSRect(x: 4 + index * 36, y: 3, width: 34, height: 28))
             button.isBordered = false
             button.focusRingType = .none
             button.setButtonType(.momentaryChange)
             button.tag = index
             button.target = self
             button.action = #selector(choose(_:))
-            button.attributedTitle = NSAttributedString(string: titles[index], attributes: [
-                .font: NSFont.systemFont(ofSize: 13, weight: .medium),
-                .foregroundColor: NSColor.white
-            ])
+            button.image = NSImage(systemSymbolName: symbols[index], accessibilityDescription: names[index])?
+                .withSymbolConfiguration(.init(pointSize: 15, weight: .medium))
+            button.imagePosition = .imageOnly
+            button.contentTintColor = .white
             button.toolTip = tips[index]
+            button.setAccessibilityLabel(names[index])
             button.isChosen = tools[index] == chosenTool
             addSubview(button)
             buttons.append(button)
         }
-        let clear = ToolButton(frame: NSRect(x: 220, y: 3, width: 52, height: 28))
+        let clear = ToolButton(frame: NSRect(x: 152, y: 3, width: 34, height: 28))
         clear.isBordered = false
         clear.focusRingType = .none
         clear.setButtonType(.momentaryChange)
         clear.target = self
         clear.action = #selector(clearAll(_:))
-        clear.attributedTitle = NSAttributedString(string: "清除", attributes: [
-            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
-            .foregroundColor: NSColor.white
-        ])
+        clear.image = NSImage(systemSymbolName: "trash", accessibilityDescription: "清除全部标注")?
+            .withSymbolConfiguration(.init(pointSize: 15, weight: .medium))
+        clear.imagePosition = .imageOnly
+        clear.contentTintColor = .white
         clear.toolTip = "清除全部标注（⌘Z 可撤销）"
         clear.setAccessibilityLabel("清除全部标注")
         // Keep it enabled: a disabled button lets the click fall through to SelectionView and reset the selection.
@@ -792,9 +794,11 @@ if CommandLine.arguments.contains("--self-test") {
     preview.clearAnnotations()
     precondition(!preview.undoAnnotation(), "Clearing nothing must not add undo history")
     let toolbar = ToolbarView(frame: .zero)
-    let clearButton = toolbar.subviews.compactMap { $0 as? NSButton }.first { $0.attributedTitle.string == "清除" }
+    let clearButton = toolbar.subviews.compactMap { $0 as? NSButton }.first { $0.accessibilityLabel() == "清除全部标注" }
     precondition(clearButton?.isEnabled == true,
                  "The clear button must stay enabled so a click cannot fall through to the selection")
+    precondition(toolbar.subviews.compactMap { $0 as? NSButton }.allSatisfy { $0.image != nil },
+                 "Toolbar buttons must use available SF Symbols instead of titles")
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = NSGraphicsContext(cgContext: cropContext, flipped: false)
     cropContext.scaleBy(x: 2, y: 2)
