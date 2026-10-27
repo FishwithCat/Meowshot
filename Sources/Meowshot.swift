@@ -25,6 +25,51 @@ struct TextCaptureState {
     }
 }
 
+enum AnnotationTool: Int {
+    case rectangle, arrow, text
+}
+
+let annotationFont = NSFont.systemFont(ofSize: 20, weight: .semibold)
+
+enum Annotation {
+    case rectangle(from: CGPoint, to: CGPoint)
+    case arrow(from: CGPoint, to: CGPoint)
+    case text(String, at: CGPoint)
+
+    func draw() {
+        let color = NSColor.systemRed
+        switch self {
+        case let .rectangle(from, to):
+            let rect = CGRect(x: min(from.x, to.x), y: min(from.y, to.y),
+                              width: abs(to.x - from.x), height: abs(to.y - from.y))
+            guard rect.width >= 1, rect.height >= 1 else { return }
+            let path = NSBezierPath(rect: rect)
+            path.lineWidth = 3
+            path.lineJoinStyle = .round
+            color.setStroke()
+            path.stroke()
+        case let .arrow(from, to):
+            guard hypot(to.x - from.x, to.y - from.y) >= 1 else { return }
+            let path = NSBezierPath()
+            path.lineWidth = 3
+            path.lineCapStyle = .round
+            path.lineJoinStyle = .round
+            path.move(to: from)
+            path.line(to: to)
+            let angle = atan2(to.y - from.y, to.x - from.x)
+            for offset in [CGFloat.pi - 0.5, CGFloat.pi + 0.5] {
+                path.move(to: to)
+                path.line(to: CGPoint(x: to.x + cos(angle + offset) * 15,
+                                      y: to.y + sin(angle + offset) * 15))
+            }
+            color.setStroke()
+            path.stroke()
+        case let .text(text, at):
+            (text as NSString).draw(at: at, withAttributes: [.font: annotationFont, .foregroundColor: color])
+        }
+    }
+}
+
 func recognizedText(in image: CGImage, request: VNRecognizeTextRequest) throws -> String {
     request.recognitionLevel = .accurate
     request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
@@ -75,12 +120,29 @@ struct RegionSelection {
                             width: rect.width * scaleX, height: rect.height * scaleY).integral
         return image.cropping(to: pixels)
     }
+
+    func renderedImage(from image: CGImage, desktopSize: CGSize, annotations: [Annotation]) -> CGImage? {
+        guard let crop = croppedImage(from: image, desktopSize: desktopSize), rect.width >= 1, rect.height >= 1,
+              let context = CGContext(data: nil, width: crop.width, height: crop.height, bitsPerComponent: 8,
+                                      bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        context.scaleBy(x: CGFloat(crop.width) / rect.width, y: CGFloat(crop.height) / rect.height)
+        NSImage(cgImage: crop, size: rect.size).draw(in: CGRect(origin: .zero, size: rect.size))
+        context.translateBy(x: -rect.minX, y: -rect.minY)
+        NSBezierPath(rect: rect).addClip()
+        for annotation in annotations { annotation.draw() }
+        NSGraphicsContext.restoreGraphicsState()
+        return context.makeImage()
+    }
 }
 
 final class SelectionWindow: NSWindow {
     override var canBecomeKey: Bool { true }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if firstResponder is NSText { return super.performKeyEquivalent(with: event) }
         if event.modifierFlags.contains(.command),
            CaptureAction.confirmation(keyCode: event.keyCode, modifiers: event.modifierFlags) != nil {
             contentView?.keyDown(with: event)
@@ -90,11 +152,92 @@ final class SelectionWindow: NSWindow {
     }
 }
 
-final class SelectionView: NSView {
+final class ToolButton: NSButton {
+    var isChosen = false {
+        didSet { needsDisplay = true }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if isChosen {
+            NSColor.white.withAlphaComponent(0.22).setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 3, dy: 3), xRadius: 6, yRadius: 6).fill()
+        }
+        super.draw(dirtyRect)
+    }
+}
+
+final class ToolbarView: NSView {
+    var onSelect: ((AnnotationTool?) -> Void)?
+    private(set) var chosenTool: AnnotationTool? {
+        didSet {
+            for (index, button) in buttons.enumerated() { button.isChosen = tools[index] == chosenTool }
+        }
+    }
+    private let tools: [AnnotationTool?] = [nil, .rectangle, .arrow, .text]
+    private var buttons: [ToolButton] = []
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 216, height: 34))
+        let titles = ["鼠标", "框选", "箭头", "文字"]
+        let tips = ["调整截图范围（拖动内部移动，拖动边缘缩放）", "绘制矩形框", "绘制箭头", "输入文字"]
+        for index in titles.indices {
+            let button = ToolButton(frame: NSRect(x: 4 + index * 52, y: 3, width: 52, height: 28))
+            button.isBordered = false
+            button.focusRingType = .none
+            button.setButtonType(.momentaryChange)
+            button.tag = index
+            button.target = self
+            button.action = #selector(choose(_:))
+            button.attributedTitle = NSAttributedString(string: titles[index], attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+                .foregroundColor: NSColor.white
+            ])
+            button.toolTip = tips[index]
+            button.isChosen = tools[index] == chosenTool
+            addSubview(button)
+            buttons.append(button)
+        }
+        setAccessibilityLabel("标注工具")
+        setAccessibilityHelp("鼠标模式可移动和缩放选区，标注工具用于绘制。")
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8)
+        NSColor(white: 0.10, alpha: 1).setFill()
+        path.fill()
+        NSColor(white: 1, alpha: 0.20).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+
+    @objc private func choose(_ sender: ToolButton) {
+        chosenTool = tools[sender.tag]
+        onSelect?(chosenTool)
+    }
+}
+
+final class SelectionView: NSView, NSTextFieldDelegate {
     var snapshot: NSImage?
     var selection = RegionSelection()
+    var annotations: [Annotation] = []
     var finish: ((CaptureAction?) -> Void)?
+    private(set) var tool: AnnotationTool?
+    private var pendingShape: (kind: AnnotationTool, start: CGPoint, end: CGPoint)?
+    private var adjustingSelection = false
+    private var textField: NSTextField?
+    private lazy var toolbar = ToolbarView(frame: .zero)
+
     override var acceptsFirstResponder: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        toolbar.onSelect = { [weak self] tool in self?.select(tool) }
+        addSubview(toolbar)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
 
@@ -108,36 +251,183 @@ final class SelectionView: NSView {
         if !selection.rect.isEmpty {
             NSColor.white.setStroke()
             NSBezierPath(rect: selection.rect).stroke()
-            NSColor.white.setFill()
-            for x in [selection.rect.minX, selection.rect.midX, selection.rect.maxX] {
-                for y in [selection.rect.minY, selection.rect.midY, selection.rect.maxY] {
-                    if x == selection.rect.midX && y == selection.rect.midY { continue }
-                    NSBezierPath(rect: NSRect(x: x - 3, y: y - 3, width: 6, height: 6)).fill()
+            if tool == nil {
+                NSColor.white.setFill()
+                for x in [selection.rect.minX, selection.rect.midX, selection.rect.maxX] {
+                    for y in [selection.rect.minY, selection.rect.midY, selection.rect.maxY] {
+                        if x == selection.rect.midX && y == selection.rect.midY { continue }
+                        NSBezierPath(rect: NSRect(x: x - 3, y: y - 3, width: 6, height: 6)).fill()
+                    }
                 }
             }
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: selection.rect).addClip()
+            for annotation in annotations { annotation.draw() }
+            if let pendingShape {
+                switch pendingShape.kind {
+                case .rectangle:
+                    Annotation.rectangle(from: pendingShape.start, to: pendingShape.end).draw()
+                case .arrow:
+                    Annotation.arrow(from: pendingShape.start, to: pendingShape.end).draw()
+                case .text:
+                    break
+                }
+            }
+            NSGraphicsContext.restoreGraphicsState()
         }
     }
 
     override func mouseDown(with event: NSEvent) {
-        selection.begin(at: convert(event.locationInWindow, from: nil))
+        let point = convert(event.locationInWindow, from: nil)
+        commitText()
+        selection.begin(at: point)
+        pendingShape = nil
+        if selection.rect.isEmpty {
+            annotations.removeAll()
+            adjustingSelection = true
+        } else if tool == nil {
+            adjustingSelection = true
+        } else if let tool, selection.rect.contains(point) {
+            adjustingSelection = false
+            switch tool {
+            case .rectangle, .arrow:
+                pendingShape = (tool, point, point)
+            case .text:
+                beginText(at: point)
+            }
+        } else {
+            adjustingSelection = true
+        }
+        layoutToolbar()
         needsDisplay = true
     }
 
     override func mouseDragged(with event: NSEvent) {
-        selection.drag(to: convert(event.locationInWindow, from: nil), within: bounds)
+        let point = convert(event.locationInWindow, from: nil)
+        if adjustingSelection {
+            selection.drag(to: point, within: bounds)
+            layoutToolbar()
+        } else if var shape = pendingShape {
+            shape.end = point
+            pendingShape = shape
+        }
         needsDisplay = true
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let shape = pendingShape {
+            switch shape.kind {
+            case .rectangle:
+                if abs(shape.end.x - shape.start.x) >= 4, abs(shape.end.y - shape.start.y) >= 4 {
+                    annotations.append(.rectangle(from: shape.start, to: shape.end))
+                }
+            case .arrow:
+                if hypot(shape.end.x - shape.start.x, shape.end.y - shape.start.y) >= 4 {
+                    annotations.append(.arrow(from: shape.start, to: shape.end))
+                }
+            case .text:
+                break
+            }
+            pendingShape = nil
+            needsDisplay = true
+        }
+        adjustingSelection = false
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKey()
-        window?.makeFirstResponder(self)
+        if textField == nil { window?.makeFirstResponder(self) }
+        layoutToolbar()
     }
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { finish?(nil) }
         else if let action = CaptureAction.confirmation(keyCode: event.keyCode, modifiers: event.modifierFlags),
                 selection.rect.width >= 1, selection.rect.height >= 1 { finish?(action) }
+    }
+
+    private func select(_ newTool: AnnotationTool?) {
+        commitText()
+        tool = newTool
+        pendingShape = nil
+        adjustingSelection = false
+        window?.makeFirstResponder(self)
+        layoutToolbar()
+        needsDisplay = true
+    }
+
+    private func layoutToolbar() {
+        guard !selection.rect.isEmpty else {
+            toolbar.isHidden = true
+            return
+        }
+        toolbar.isHidden = false
+        let size = toolbar.frame.size
+        var x = selection.rect.midX - size.width / 2
+        var y = selection.rect.minY - size.height - 10
+        if y < bounds.minY + 10 { y = selection.rect.maxY + 10 }
+        if y + size.height > bounds.maxY - 10 {
+            y = min(max(bounds.minY + 10, selection.rect.minY + 10), bounds.maxY - size.height - 10)
+        }
+        x = min(max(bounds.minX + 10, x), bounds.maxX - size.width - 10)
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
+        toolbar.frame.origin = CGPoint(x: (x * scale).rounded() / scale, y: (y * scale).rounded() / scale)
+    }
+
+    private func beginText(at point: CGPoint) {
+        let width = min(240, selection.rect.width)
+        let field = NSTextField(frame: NSRect(x: min(point.x, selection.rect.maxX - width),
+                                             y: min(point.y, selection.rect.maxY - 30),
+                                             width: width, height: 30))
+        field.font = annotationFont
+        field.textColor = .systemRed
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.placeholderString = "输入文字"
+        field.delegate = self
+        addSubview(field)
+        textField = field
+        window?.makeFirstResponder(field)
+    }
+
+    private func commitText() {
+        guard let field = textField else { return }
+        textField = nil
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let origin = field.frame.origin
+        field.removeFromSuperview()
+        if !text.isEmpty { annotations.append(.text(text, at: origin)) }
+        window?.makeFirstResponder(self)
+        needsDisplay = true
+    }
+
+    private func discardText() {
+        guard let field = textField else { return }
+        textField = nil
+        field.removeFromSuperview()
+        window?.makeFirstResponder(self)
+        needsDisplay = true
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = textField else { return }
+        let width = (field.stringValue as NSString).size(withAttributes: [.font: annotationFont]).width + 16
+        field.frame.size.width = min(max(80, width), selection.rect.maxX - field.frame.minX)
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        commitText()
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            discardText()
+            return true
+        }
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            commitText()
+            return true
+        }
+        return false
     }
 }
 
@@ -244,7 +534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let view = SelectionView(frame: CGRect(origin: .zero, size: desktop.size))
         view.snapshot = NSImage(cgImage: snapshot, size: desktop.size)
         view.setAccessibilityLabel("截图选区")
-        view.setAccessibilityHelp("拖动选区内部移动，拖动边缘调整大小，Return 复制图片，Command Return 复制文字，Escape 取消。")
+        view.setAccessibilityHelp("拖动选区内部移动，拖动边缘调整大小。工具条可切回鼠标调整选区，或绘制矩形框、箭头和文字。Return 复制图片，Command Return 复制文字，Escape 取消。")
         view.finish = { [weak self, weak view] action in
             guard let self, let view else { return }
             self.selectionWindow?.close()
@@ -252,8 +542,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.previousApplication?.activate(options: .activateIgnoringOtherApps)
             self.previousApplication = nil
             self.captureItem.isEnabled = true
-            if let action, let image = view.selection.croppedImage(from: snapshot, desktopSize: desktop.size) {
-                self.takeScreenshot(image: image, action: action)
+            if let action {
+                let image = action == .image
+                    ? view.selection.renderedImage(from: snapshot, desktopSize: desktop.size, annotations: view.annotations)
+                    : view.selection.croppedImage(from: snapshot, desktopSize: desktop.size)
+                if let image { self.takeScreenshot(image: image, action: action) }
             }
         }
         window.contentView = view
@@ -437,7 +730,58 @@ if CommandLine.arguments.contains("--self-test") {
     selection.begin(at: CGPoint(x: 54, y: 55))
     selection.drag(to: CGPoint(x: 80, y: 30), within: bounds)
     precondition(selection.rect == CGRect(x: 60, y: 30, width: 20, height: 30), "Small selections must resize across the opposite edge")
-    print("PASS: permission flow, selection, frozen Retina crop, OCR actions and clipboard success/failure/cancellation")
+
+    var annotatedSelection = RegionSelection()
+    annotatedSelection.rect = CGRect(x: 10, y: 10, width: 50, height: 50)
+    let annotationContext = CGContext(data: nil, width: 200, height: 200, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    annotationContext.setFillColor(CGColor(gray: 1, alpha: 1))
+    annotationContext.fill(CGRect(x: 0, y: 0, width: 200, height: 200))
+    annotationContext.setFillColor(CGColor(gray: 0, alpha: 1))
+    annotationContext.fill(CGRect(x: 0, y: 40, width: 200, height: 20))
+    let annotationSource = annotationContext.makeImage()!
+    func redPixelCount(_ image: CGImage) -> Int {
+        let rep = NSBitmapImageRep(cgImage: image)
+        var count = 0
+        for x in 0..<rep.pixelsWide {
+            for y in 0..<rep.pixelsHigh {
+                if let color = rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+                   color.redComponent > 0.6, color.greenComponent < 0.5 { count += 1 }
+            }
+        }
+        return count
+    }
+    let desktopSize = CGSize(width: 100, height: 100)
+    let plainImage = annotatedSelection.renderedImage(from: annotationSource, desktopSize: desktopSize, annotations: [])!
+    precondition(redPixelCount(plainImage) == 0, "Empty annotations must not alter the copied image")
+    let markedImage = annotatedSelection.renderedImage(
+        from: annotationSource, desktopSize: desktopSize,
+        annotations: [.arrow(from: CGPoint(x: 20, y: 30), to: CGPoint(x: 55, y: 30)),
+                      .text("Hi", at: CGPoint(x: 15, y: 40))])!
+    precondition(redPixelCount(markedImage) > 100, "Arrows and text must render into the copied image")
+    let markedPixels = NSBitmapImageRep(cgImage: markedImage)
+    // colorAt uses top-left pixel coordinates: the arrow sits 40px above the selection bottom.
+    let arrowPixel = markedPixels.colorAt(x: 40, y: 60)!.usingColorSpace(.deviceRGB)!
+    precondition(arrowPixel.redComponent > 0.6 && arrowPixel.greenComponent < 0.5,
+                 "The arrow must keep selection-relative coordinates")
+    let topPixel = markedPixels.colorAt(x: 5, y: 30)!.usingColorSpace(.deviceRGB)!
+    let bandPixel = markedPixels.colorAt(x: 5, y: 70)!.usingColorSpace(.deviceRGB)!
+    precondition(topPixel.redComponent > 0.99 && bandPixel.redComponent < 0.01,
+                 "The copied image must keep its orientation")
+    let rectangleImage = annotatedSelection.renderedImage(
+        from: annotationSource, desktopSize: desktopSize,
+        annotations: [.rectangle(from: CGPoint(x: 15, y: 20), to: CGPoint(x: 45, y: 40))])!
+    let rectanglePixels = NSBitmapImageRep(cgImage: rectangleImage)
+    precondition(rectanglePixels.colorAt(x: 40, y: 40)!.usingColorSpace(.deviceRGB)!.redComponent > 0.6,
+                 "The rectangle tool must draw an outline")
+    precondition(rectanglePixels.colorAt(x: 40, y: 55)!.usingColorSpace(.deviceRGB)!.redComponent > 0.99,
+                 "The rectangle interior must stay transparent")
+    let outsideImage = annotatedSelection.renderedImage(
+        from: annotationSource, desktopSize: desktopSize,
+        annotations: [.arrow(from: CGPoint(x: 70, y: 70), to: CGPoint(x: 90, y: 90))])!
+    precondition(redPixelCount(outsideImage) == 0, "Annotations outside the selection must be clipped")
+    print("PASS: permission flow, selection, frozen Retina crop, rectangle/arrow/text annotations, OCR actions and clipboard success/failure/cancellation")
 } else {
     let app = NSApplication.shared
     let delegate = AppDelegate()
