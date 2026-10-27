@@ -272,6 +272,7 @@ final class SelectionView: NSView, NSTextFieldDelegate {
         toolbar.onSelect = { [weak self] tool in self?.select(tool) }
         toolbar.onClear = { [weak self] in self?.clearAnnotations() }
         addSubview(toolbar)
+        layoutToolbar()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -780,6 +781,8 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(pixels[0] == 255 && pixels[1] == 255 && pixels[2] == 255,
                  "Crop must use the frozen frame and convert bottom-left selection coordinates")
     let preview = SelectionView(frame: bounds)
+    precondition(preview.subviews.compactMap { $0 as? ToolbarView }.first?.isHidden == true,
+                 "Toolbar must stay hidden until a selection exists")
     preview.snapshot = NSImage(cgImage: frozen, size: bounds.size)
     preview.selection = selection
     let keptSelection = preview.selection.rect
